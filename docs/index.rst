@@ -6,6 +6,11 @@
 redis-completion
 ================
 
+.. warning::
+    This project is now deprecated. The code has a new home as a part
+    of `walrus <https://gitub.com/coleifer/walrus>`_, a set of Python
+    utilities for working with Redis.
+
 autocompletion with `redis <http://redis.io>`_ based on:
 
 * http://antirez.com/post/autocomplete-with-redis.html

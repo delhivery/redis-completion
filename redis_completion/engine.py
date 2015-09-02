@@ -4,20 +4,27 @@ except ImportError:
     import json
 from itertools import izip_longest
 import re
-from redis import Redis
+from rediscluster import RedisCluster
 
 from redis_completion.stop_words import STOP_WORDS as _STOP_WORDS
 
-
-# aggressive stop words will be better when the length of the document is longer
+# aggressive stop words will be better when the length of the document
+# is longer
 AGGRESSIVE_STOP_WORDS = _STOP_WORDS
 
 # default stop words should work fine for titles and things like that
 DEFAULT_STOP_WORDS = set(['a', 'an', 'of', 'the'])
 
-
 # Keep track of empty objects.
 _sentinel = object()
+
+
+def kcombine(_id, _type):
+    return ''.join([str(_id), '\x01', str(_type)])
+
+
+def ksplit(key):
+    return key.split('\x01', 1)
 
 
 class RedisEngine(object):
@@ -29,10 +36,12 @@ class RedisEngine(object):
     http://stackoverflow.com/questions/1958005/redis-autocomplete/1966188#1966188
     http://patshaughnessy.net/2011/11/29/two-ways-of-using-redis-to-build-a-nosql-autocomplete-search-index
     """
-    def __init__(self, prefix='ac', stop_words=None, cache_timeout=300,redis_client=None,
-                 **conn_kwargs):
+    def __init__(
+            self, prefix='ac', stop_words=None, cache_timeout=300,
+            redis_client=None, **conn_kwargs):
         self.prefix = prefix
-        self.stop_words = (stop_words is None) and DEFAULT_STOP_WORDS or stop_words
+        self.stop_words = (
+            stop_words is None) and DEFAULT_STOP_WORDS or stop_words
         self.cache_timeout = cache_timeout
 
         self.conn_kwargs = conn_kwargs
@@ -44,15 +53,17 @@ class RedisEngine(object):
         self.boost_key = '%s:b' % self.prefix
         self.data_key = '%s:d' % self.prefix
         self.title_key = '%s:t' % self.prefix
-        self.search_key = lambda k: '%s:s:%s' % (self.prefix, k)
-        self.cache_key = lambda pk, bk: '%s:c:%s:%s' % (self.prefix, pk, bk)
 
-        self.kcombine = lambda _id, _type: ''.join([str(_id), '\x01', str(_type)])
-        self.ksplit = lambda k: k.split('\x01', 1)
         self._offset = 27**20
 
+    def search_key(self, k):
+        return '{}:s:{}'.format(self.prefix, k)
+
+    def cache_key(self, pk, bk):
+        return '{}:c:{}:{}'.format(self.prefix, pk, bk)
+
     def get_client(self):
-        return Redis(**self.conn_kwargs)
+        return RedisCluster(**self.conn_kwargs)
 
     def score_key(self, k, max_size=20):
         k_len = len(k)
@@ -92,7 +103,9 @@ class RedisEngine(object):
         for i in range(0, len(keys), batch_size):
             self.client.delete(*keys[i:i+batch_size])
 
-    def store(self, obj_id, title=None, data=None, obj_type=None, check_exist=True):
+    def store(
+            self, obj_id, title=None, data=None, obj_type=None,
+            check_exist=True):
         if title is None:
             title = obj_id
         if data is None:
@@ -100,38 +113,36 @@ class RedisEngine(object):
 
         title_score = self.score_key(self.create_key(title))
 
-        combined_id = self.kcombine(obj_id, obj_type or '')
+        combined_id = kcombine(obj_id, obj_type or '')
 
         if check_exist and self.exists(obj_id, obj_type):
             stored_title = self.client.hget(self.title_key, combined_id)
 
-            # if the stored title is the same, we can simply update the data key
-            # since everything else will have stayed the same
+            # if the stored title is the same, we can simply update the data
+            # key since everything else will have stayed the same
             if stored_title == title:
                 self.client.hset(self.data_key, combined_id, data)
                 return
             else:
                 self.remove(obj_id, obj_type)
 
-        pipe = self.client.pipeline()
-        pipe.hset(self.data_key, combined_id, data)
-        pipe.hset(self.title_key, combined_id, title)
+        self.client.hset(self.data_key, combined_id, data)
+        self.client.hset(self.title_key, combined_id, title)
 
         for i, word in enumerate(self.clean_phrase(title)):
             word_score = self.score_key(word) + self._offset
             key_score = (word_score * (i + 1)) + (title_score)
             for partial_key in self.autocomplete_keys(word):
-                pipe.zadd(self.search_key(partial_key), combined_id, key_score)
-
-        pipe.execute()
+                self.client.zadd(
+                    self.search_key(partial_key), combined_id, key_score
+                )
 
     def store_json(self, obj_id, title, data_dict, obj_type=None):
         return self.store(obj_id, title, json.dumps(data_dict), obj_type)
 
     def remove(self, obj_id, obj_type=None):
-        obj_id = self.kcombine(obj_id, obj_type or '')
+        obj_id = kcombine(obj_id, obj_type or '')
         title = self.client.hget(self.title_key, obj_id) or ''
-        keys = []
 
         for word in self.clean_phrase(title):
             for partial_key in self.autocomplete_keys(word):
@@ -146,7 +157,8 @@ class RedisEngine(object):
         self.client.hdel(self.boost_key, obj_id)
 
     def boost(self, obj_id, multiplier=1.1, negative=False):
-        # take the existing boost for this item and increase it by the multiplier
+        # take the existing boost for this item and increase it by
+        # the multiplier
         current = self.client.hget(self.boost_key, obj_id)
         current_f = float(current or 1.0)
         if negative:
@@ -154,12 +166,14 @@ class RedisEngine(object):
         self.client.hset(self.boost_key, obj_id, current_f * multiplier)
 
     def exists(self, obj_id, obj_type=None):
-        obj_id = self.kcombine(obj_id, obj_type or '')
+        obj_id = kcombine(obj_id, obj_type or '')
         return self.client.hexists(self.data_key, obj_id)
 
     def get_cache_key(self, phrases, boosts):
         if boosts:
-            boost_key = '|'.join('%s:%s' % (k, v) for k, v in sorted(boosts.items()))
+            boost_key = '|'.join(
+                '{}:{}'.format(k, v) for k, v in sorted(boosts.items())
+            )
         else:
             boost_key = ''
         phrase_key = '|'.join(phrases)
@@ -209,7 +223,9 @@ class RedisEngine(object):
 
         return data
 
-    def search(self, phrase, limit=None, filters=None, mappers=None, boosts=None, autoboost=False):
+    def search(
+            self, phrase, limit=None, filters=None, mappers=None,
+            boosts=None, autoboost=False):
         cleaned = self.clean_phrase(phrase)
         if not cleaned:
             return []
@@ -231,20 +247,22 @@ class RedisEngine(object):
                 self.client.expire(new_key, self.cache_timeout)
 
         if boosts:
-            pipe = self.client.pipeline()
-            for raw_id, score in self.client.zrange(new_key, 0, -1, withscores=True):
+
+            for raw_id, score in self.client.zrange(
+                    new_key, 0, -1, withscores=True):
                 orig_score = score
-                for part in self.ksplit(raw_id):
+                for part in ksplit(raw_id):
                     if part and part in boosts:
                         score *= 1 / boosts[part]
                 if orig_score != score:
-                    pipe.zadd(new_key, raw_id, score)
-            pipe.execute()
+                    self.client.zadd(new_key, raw_id, score)
 
         id_list = self.client.zrange(new_key, 0, -1)
         return self._process_ids(id_list, limit, filters, mappers)
 
-    def search_json(self, phrase, limit=None, filters=None, mappers=None, boosts=None, autoboost=False):
+    def search_json(
+            self, phrase, limit=None, filters=None, mappers=None,
+            boosts=None, autoboost=False):
         if not mappers:
             mappers = []
         mappers.insert(0, json.loads)
